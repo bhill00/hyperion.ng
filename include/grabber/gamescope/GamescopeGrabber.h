@@ -4,10 +4,10 @@
 
 #include <QJsonArray>
 #include <QJsonObject>
+#include <QMutex>
+#include <QWaitCondition>
 
 #include <atomic>
-#include <condition_variable>
-#include <mutex>
 #include <optional>
 #include <thread>
 #include <vector>
@@ -102,9 +102,9 @@ private:
 
 	std::atomic<bool> _connected{false};
 	std::atomic<bool> _stopping{false};
-	std::mutex _retryMutex;
-	std::condition_variable _retryCv;
+	QMutex _retryMutex;
+	QWaitCondition _retryCv;
 
-	std::mutex _bufferMutex;
+	QMutex _bufferMutex;
 	FrameBuffer _frontBuffer;
 };

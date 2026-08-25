@@ -1,6 +1,7 @@
 #include <grabber/gamescope/GamescopeGrabber.h>
 
-#include <chrono>
+#include <QDeadlineTimer>
+
 #include <cstring>
 #include <sys/mman.h>
 
@@ -11,7 +12,7 @@
 #pragma GCC diagnostic pop
 
 namespace {
-	constexpr auto RETRY_INTERVAL = std::chrono::milliseconds(2000);
+	constexpr int RETRY_INTERVAL_MS = 2000;
 }
 
 GamescopeGrabber::GamescopeGrabber(int cropLeft, int cropRight, int cropTop, int cropBottom)
@@ -33,7 +34,7 @@ GamescopeGrabber::~GamescopeGrabber()
 void GamescopeGrabber::stop()
 {
 	_stopping = true;
-	_retryCv.notify_all();
+	_retryCv.wakeAll();
 
 	if (_loop)
 	{
@@ -54,7 +55,7 @@ int GamescopeGrabber::grabFrame(Image<ColorRgb>& image, bool /*forceUpdate*/)
 		return -1;
 	}
 
-	std::lock_guard<std::mutex> lock(_bufferMutex);
+	QMutexLocker locker(&_bufferMutex);
 	if (!_frontBuffer.valid)
 	{
 		return -1;
@@ -169,7 +170,16 @@ void GamescopeGrabber::onStreamStateChanged(void* userdata, enum pw_stream_state
 	{
 		if (error != nullptr)
 		{
-			Warning(self->_log, "[pipewire] gamescope stream ended: %s", error);
+			// UNCONNECTED is an expected, routine transition (e.g. the user closed their
+			// game) - not worth a Warning. A real problem still surfaces via ERROR.
+			if (state == PW_STREAM_STATE_ERROR)
+			{
+				Warning(self->_log, "[pipewire] gamescope stream ended: %s", error);
+			}
+			else
+			{
+				Info(self->_log, "[pipewire] gamescope stream ended: %s", error);
+			}
 		}
 
 		self->_connected = false;
@@ -177,7 +187,7 @@ void GamescopeGrabber::onStreamStateChanged(void* userdata, enum pw_stream_state
 		self->_height = 0;
 
 		{
-			std::lock_guard<std::mutex> lock(self->_bufferMutex);
+			QMutexLocker locker(&self->_bufferMutex);
 			self->_frontBuffer.valid = false;
 		}
 
@@ -297,7 +307,7 @@ void GamescopeGrabber::onStreamProcess(void* userdata)
 	const size_t byteCount = stride * static_cast<size_t>(height);
 
 	{
-		std::lock_guard<std::mutex> lock(self->_bufferMutex);
+		QMutexLocker locker(&self->_bufferMutex);
 		self->_frontBuffer.data.assign(src, src + byteCount);
 		self->_frontBuffer.width = width;
 		self->_frontBuffer.height = height;
@@ -412,7 +422,12 @@ void GamescopeGrabber::runStream()
 			// gamescope either hand back a plain CPU-readable buffer or fail to
 			// negotiate a format cleanly, instead of negotiating successfully
 			// and then failing later at the buffer-import step.
-			SPA_POD_Propf(SPA_FORMAT_VIDEO_modifier, SPA_POD_PROP_FLAG_MANDATORY, SPA_POD_CHOICE_ENUM_Long(2, 0L, 0L))
+			// SPA_POD_Propf() isn't declared in the SPA headers shipped by all supported
+			// distros (missing on e.g. Ubuntu 24.04's older libspa) - spelled out manually here
+			// instead of relying on that convenience macro. This is its exact expansion where it
+			// does exist (spa/pod/vararg.h: SPA_POD_Propf(key,flags,...) -> SPA_ID_INVALID, key,
+			// flags, ##__VA_ARGS__), so behavior is unchanged on systems where it's available.
+			SPA_ID_INVALID, SPA_FORMAT_VIDEO_modifier, SPA_POD_PROP_FLAG_MANDATORY, SPA_POD_CHOICE_ENUM_Long(2, 0L, 0L)
 		))
 	};
 
@@ -433,8 +448,12 @@ void GamescopeGrabber::runStream()
 
 void GamescopeGrabber::waitBeforeRetry()
 {
-	std::unique_lock<std::mutex> lock(_retryMutex);
-	_retryCv.wait_for(lock, RETRY_INTERVAL, [this] { return _stopping.load(); });
+	QMutexLocker locker(&_retryMutex);
+	QDeadlineTimer deadline(RETRY_INTERVAL_MS);
+	while (!_stopping.load() && !deadline.hasExpired())
+	{
+		_retryCv.wait(&_retryMutex, deadline);
+	}
 }
 
 void GamescopeGrabber::pipewireThreadMain()

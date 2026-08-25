@@ -8,15 +8,17 @@
 #include <QDBusObjectPath>
 #include <QDBusUnixFileDescriptor>
 #include <QDBusVariant>
+#include <QDeadlineTimer>
 #include <QDir>
 #include <QEventLoop>
 #include <QFile>
+#include <QFileInfo>
 #include <QObject>
+#include <QStandardPaths>
 
 #include <algorithm>
 #include <chrono>
 #include <cstring>
-#include <mutex>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -27,7 +29,12 @@
 #pragma GCC diagnostic pop
 
 namespace {
-	constexpr auto RETRY_INTERVAL = std::chrono::milliseconds(2000);
+	constexpr int RETRY_INTERVAL_MS = 2000;
+
+	// Matches GrabberWrapper::DEFAULT_MAX_GRAB_RATE_HZ - see the rateMax comment further down in
+	// this file for why this grabber (unlike GamescopeGrabber) actually enforces this as a hard
+	// PipeWire negotiation ceiling rather than just a UI-facing suggestion.
+	constexpr int MAX_FPS = 30;
 
 	// See onStreamProcess()'s comment on the CPU cost of reading DMA-BUF/GPU memory from the
 	// CPU: only every Nth row/column is actually read out of the (slow) source buffer. Shared
@@ -142,6 +149,19 @@ DesktopPortalGrabber::DesktopPortalGrabber(int cropLeft, int cropRight, int crop
 	// shape reports availability unconditionally rather than deciding it once at construction.
 	_isAvailable = true;
 
+	// The base Grabber::DEFAULT_SUPPORTED_FPS_LIST includes rates above what this grabber's
+	// PipeWire negotiation actually allows (rateMax, further down in this file) - trim it so the
+	// UI doesn't offer an fps this grabber can never honor.
+	QJsonArray fpsSupported;
+	for (const QJsonValue& fps : getFpsSupported())
+	{
+		if (fps.toInt() <= MAX_FPS)
+		{
+			fpsSupported.append(fps);
+		}
+	}
+	setFpsSupported(fpsSupported);
+
 	_thread.emplace(&DesktopPortalGrabber::portalThreadMain, this);
 }
 
@@ -153,7 +173,7 @@ DesktopPortalGrabber::~DesktopPortalGrabber()
 void DesktopPortalGrabber::stop()
 {
 	_stopping = true;
-	_retryCv.notify_all();
+	_retryCv.wakeAll();
 
 	if (_loop)
 	{
@@ -174,7 +194,7 @@ int DesktopPortalGrabber::grabFrame(Image<ColorRgb>& image, bool /*forceUpdate*/
 		return -1;
 	}
 
-	std::lock_guard<std::mutex> lock(_bufferMutex);
+	QMutexLocker locker(&_bufferMutex);
 	if (!_frontBuffer.valid)
 	{
 		return -1;
@@ -241,7 +261,10 @@ QJsonObject DesktopPortalGrabber::discover(const QJsonObject& /*params*/)
 
 QString DesktopPortalGrabber::restoreTokenPath() const
 {
-	return QDir::homePath() + QStringLiteral("/.hyperion/desktop-portal-restore-token");
+	// Hyperion's configuration/runtime directory can't be assumed to be a fixed
+	// $HOME/.hyperion (see ProviderRestApi::matchesPinnedCertificate() for the same pattern).
+	QString const appDataDir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+	return appDataDir + QStringLiteral("/token/desktop-portal-restore-token");
 }
 
 QString DesktopPortalGrabber::readRestoreToken() const
@@ -257,10 +280,18 @@ QString DesktopPortalGrabber::readRestoreToken() const
 
 void DesktopPortalGrabber::writeRestoreToken(const QString& token) const
 {
-	QFile file(restoreTokenPath());
+	QString const tokenPath = restoreTokenPath();
+
+	if (!QDir().mkpath(QFileInfo(tokenPath).path()))
+	{
+		Warning(_log, "[desktop-portal] Failed to create directory for restore token at %s", QSTRING_CSTR(tokenPath));
+		return;
+	}
+
+	QFile file(tokenPath);
 	if (!file.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Truncate))
 	{
-		Warning(_log, "[desktop-portal] Failed to save restore token to %s", QSTRING_CSTR(restoreTokenPath()));
+		Warning(_log, "[desktop-portal] Failed to save restore token to %s", QSTRING_CSTR(tokenPath));
 		return;
 	}
 
@@ -433,7 +464,17 @@ void DesktopPortalGrabber::onStreamStateChanged(void* userdata, enum pw_stream_s
 	{
 		if (error != nullptr)
 		{
-			Warning(self->_log, "[desktop-portal] stream ended: %s", error);
+			// UNCONNECTED is an expected, routine transition (e.g. permission revoked, portal
+			// session ended normally) - not worth a Warning. A real problem still surfaces via
+			// ERROR.
+			if (state == PW_STREAM_STATE_ERROR)
+			{
+				Warning(self->_log, "[desktop-portal] stream ended: %s", error);
+			}
+			else
+			{
+				Info(self->_log, "[desktop-portal] stream ended: %s", error);
+			}
 		}
 
 		self->_connected = false;
@@ -441,7 +482,7 @@ void DesktopPortalGrabber::onStreamStateChanged(void* userdata, enum pw_stream_s
 		self->_height = 0;
 
 		{
-			std::lock_guard<std::mutex> lock(self->_bufferMutex);
+			QMutexLocker locker(&self->_bufferMutex);
 			self->_frontBuffer.valid = false;
 		}
 
@@ -640,7 +681,7 @@ void DesktopPortalGrabber::onStreamProcess(void* userdata)
 	rowStaging.resize(static_cast<size_t>(width) * 4);
 
 	{
-		std::lock_guard<std::mutex> lock(self->_bufferMutex);
+		QMutexLocker locker(&self->_bufferMutex);
 		self->_frontBuffer.data.resize(sampledStride * static_cast<size_t>(sampledHeight));
 
 		for (int y = 0; y < sampledHeight; ++y)
@@ -734,7 +775,7 @@ void DesktopPortalGrabber::runStream()
 	// compositor will happily negotiate up to full native display refresh rate (confirmed:
 	// left uncapped, this pinned a full CPU core continuously copying frames onStreamProcess()
 	// never needs for ambient lighting) if given the room to.
-	spa_fraction rateMax = SPA_FRACTION(30, 1);
+	spa_fraction rateMax = SPA_FRACTION(MAX_FPS, 1);
 
 	// Two format alternatives, most-preferred first. params[0] is the original DMA-BUF request
 	// with a mandatory LINEAR modifier - cheap for this code to decode, and what AMD/Mesa
@@ -768,7 +809,12 @@ void DesktopPortalGrabber::runStream()
 			// Same LINEAR-modifier requirement as GamescopeGrabber - a normal compositor's
 			// composited output can be a tiled/compressed DMA-BUF just as easily as
 			// gamescope's, and this code has no way to decode that layout.
-			SPA_POD_Propf(SPA_FORMAT_VIDEO_modifier, SPA_POD_PROP_FLAG_MANDATORY, SPA_POD_CHOICE_ENUM_Long(2, 0L, 0L))
+			// SPA_POD_Propf() isn't declared in the SPA headers shipped by all supported
+			// distros (missing on e.g. Ubuntu 24.04's older libspa) - spelled out manually here
+			// instead of relying on that convenience macro. This is its exact expansion where it
+			// does exist (spa/pod/vararg.h: SPA_POD_Propf(key,flags,...) -> SPA_ID_INVALID, key,
+			// flags, ##__VA_ARGS__), so behavior is unchanged on systems where it's available.
+			SPA_ID_INVALID, SPA_FORMAT_VIDEO_modifier, SPA_POD_PROP_FLAG_MANDATORY, SPA_POD_CHOICE_ENUM_Long(2, 0L, 0L)
 		)),
 		static_cast<spa_pod*>(spa_pod_builder_add_object(&podBuilder2,
 			SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat,
@@ -817,8 +863,12 @@ void DesktopPortalGrabber::clearDmaBufMappings()
 
 void DesktopPortalGrabber::waitBeforeRetry()
 {
-	std::unique_lock<std::mutex> lock(_retryMutex);
-	_retryCv.wait_for(lock, RETRY_INTERVAL, [this] { return _stopping.load(); });
+	QMutexLocker locker(&_retryMutex);
+	QDeadlineTimer deadline(RETRY_INTERVAL_MS);
+	while (!_stopping.load() && !deadline.hasExpired())
+	{
+		_retryCv.wait(&_retryMutex, deadline);
+	}
 }
 
 void DesktopPortalGrabber::portalThreadMain()

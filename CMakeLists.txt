@@ -139,7 +139,7 @@ set(DEFAULT_V4L2                        OFF)
 set(DEFAULT_AUDIO                       ON)
 set(DEFAULT_X11                         OFF)
 set(DEFAULT_XCB                         OFF)
-set(DEFAULT_GAMESCOPE                    OFF)
+set(DEFAULT_GAMESCOPE                   OFF)
 set(DEFAULT_DESKTOP_PORTAL              OFF)
 
 # Input

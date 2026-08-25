@@ -876,85 +876,49 @@ void HyperionDaemon::updateAudioGrabbers(const QJsonObject& /*grabberConfig*/)
 
 QString HyperionDaemon::evalScreenGrabberType()
 {
-	QString type;
-
 #ifdef ENABLE_GAMESCOPE
-	// gamescope -> GAMESCOPE_WAYLAND_DISPLAY is set for processes running inside a
-	// gamescope session, even though gamescope also sets XDG_SESSION_TYPE=x11 for
-	// legacy X11 game compatibility. Check this first: the x11/xcb grabbers below
-	// would otherwise capture the wrong (nested Xwayland root) window.
+	// gamescope -> GAMESCOPE_WAYLAND_DISPLAY is set inside gamescope sessions
 	if (!qEnvironmentVariableIsEmpty("GAMESCOPE_WAYLAND_DISPLAY"))
 	{
-		type = "gamescope";
-	}
-#ifdef ENABLE_DESKTOP_PORTAL
-	// desktop-portal -> a real (non-gamescope) Wayland session. x11/xcb/qt below all
-	// refuse to run under Wayland, so this is the only grabber that can actually work here.
-	else if (!qEnvironmentVariableIsEmpty("WAYLAND_DISPLAY"))
-	{
-		type = "desktop-portal";
+		return "gamescope";
 	}
 #endif
-	// dispmanx -> on raspi
-	else if (QFile::exists("/dev/vchiq"))
-	{
-		type = "dispmanx";
-	}
-#else
+
 #ifdef ENABLE_DESKTOP_PORTAL
-	// desktop-portal -> a real (non-gamescope) Wayland session. x11/xcb/qt below all
-	// refuse to run under Wayland, so this is the only grabber that can actually work here.
+	// desktop-portal -> real Wayland session
 	if (!qEnvironmentVariableIsEmpty("WAYLAND_DISPLAY"))
 	{
-		type = "desktop-portal";
+		return "desktop-portal";
 	}
-	// dispmanx -> on raspi
-	else if (QFile::exists("/dev/vchiq"))
-	{
-		type = "dispmanx";
-	}
-#else
-	// dispmanx -> on raspi
+#endif
+
+	// dispmanx -> Raspberry Pi
 	if (QFile::exists("/dev/vchiq"))
 	{
-		type = "dispmanx";
+		return "dispmanx";
 	}
-#endif
-#endif
-	// amlogic -> /dev/amvideo exists
-	else
+
+	// amlogic -> Amlogic devices
+	if (QFile::exists("/dev/amvideo"))
 	{
-		if (QFile::exists("/dev/amvideo"))
+		static const QString amlDevice("/dev/amvideocap0");
+		if (!QFile::exists(amlDevice))
 		{
-			type = "amlogic";
-
-			QString const amlDevice("/dev/amvideocap0");
-			if (!QFile::exists(amlDevice))
-			{
-				Error(_log, "grabber device '%s' for type amlogic not found!", QSTRING_CSTR(amlDevice));
-			}
+			Error(_log, "grabber device '%s' for type amlogic not found!", QSTRING_CSTR(amlDevice));
 		}
-		else
-		{
-			// x11 -> if DISPLAY is set
-			QByteArray const envDisplay = qgetenv("DISPLAY");
-			if (!envDisplay.isEmpty())
-			{
-#if defined(ENABLE_X11)
-				type = "x11";
-#elif defined(ENABLE_XCB)
-				type = "xcb";
-#else
-				type = "qt";
-#endif
-			}
-			// qt -> if nothing other applies
-			else
-			{
-				type = "qt";
-			}
-		}
+		return "amlogic";
 	}
 
-	return type;
+	// X11 / XCB fallback if DISPLAY is set
+	if (!qEnvironmentVariableIsEmpty("DISPLAY"))
+	{
+#if defined(ENABLE_X11)
+		return "x11";
+#elif defined(ENABLE_XCB)
+		return "xcb";
+#endif
+	}
+
+	// Default fallback
+	return "qt";
 }
