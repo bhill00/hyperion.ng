@@ -793,29 +793,45 @@ void DesktopPortalGrabber::runStream()
 	uint8_t buffer2[1024];
 	spa_pod_builder podBuilder2 = SPA_POD_BUILDER_INIT(buffer2, sizeof(buffer2));
 
+	// params[0]: DMA-BUF path with mandatory LINEAR modifier.
+	// spa_pod_builder_add_object's vararg protocol has no slot for per-property
+	// flags, so we cannot use it together with SPA_POD_PROP_FLAG_MANDATORY on
+	// the modifier property. Build the object manually instead, following the
+	// pattern from spa_format_video_raw_build() in <spa/param/video/raw-utils.h>:
+	// push the object frame, add all flag-free properties via spa_pod_builder_add,
+	// then emit the modifier property via spa_pod_builder_prop (which does accept
+	// flags) + an explicit choice pod, and finally pop the object frame.
+	spa_pod_frame outerFrame;
+	spa_pod_builder_push_object(&podBuilder, &outerFrame, SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat);
+	spa_pod_builder_add(&podBuilder,
+		SPA_FORMAT_mediaType,    SPA_POD_Id(SPA_MEDIA_TYPE_video),
+		SPA_FORMAT_mediaSubtype, SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
+		SPA_FORMAT_VIDEO_format, SPA_POD_CHOICE_ENUM_Id(4,
+			SPA_VIDEO_FORMAT_BGRx,
+			SPA_VIDEO_FORMAT_BGRx,
+			SPA_VIDEO_FORMAT_RGBx,
+			SPA_VIDEO_FORMAT_BGRA
+		),
+		SPA_FORMAT_VIDEO_size,      SPA_POD_CHOICE_RANGE_Rectangle(&rectDefault, &rectMin, &rectMax),
+		SPA_FORMAT_VIDEO_framerate, SPA_POD_CHOICE_RANGE_Fraction(&rateDefault, &rateMin, &rateMax),
+		0
+	);
+	// Same LINEAR-modifier requirement as GamescopeGrabber - a normal compositor's
+	// composited output can be a tiled/compressed DMA-BUF just as easily as
+	// gamescope's, and this code has no way to decode that layout.
+	spa_pod_builder_prop(&podBuilder, SPA_FORMAT_VIDEO_modifier, SPA_POD_PROP_FLAG_MANDATORY);
+	{
+		spa_pod_frame choiceFrame;
+		spa_pod_builder_push_choice(&podBuilder, &choiceFrame, SPA_CHOICE_Enum, 0);
+		spa_pod_builder_long(&podBuilder, 0L); // default: DRM_FORMAT_MOD_LINEAR
+		spa_pod_builder_long(&podBuilder, 0L); // only allowed value: DRM_FORMAT_MOD_LINEAR
+		spa_pod_builder_pop(&podBuilder, &choiceFrame);
+	}
+
 	const spa_pod* params[2] = {
-		static_cast<spa_pod*>(spa_pod_builder_add_object(&podBuilder,
-			SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat,
-			SPA_FORMAT_mediaType,    SPA_POD_Id(SPA_MEDIA_TYPE_video),
-			SPA_FORMAT_mediaSubtype, SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
-			SPA_FORMAT_VIDEO_format, SPA_POD_CHOICE_ENUM_Id(4,
-				SPA_VIDEO_FORMAT_BGRx,
-				SPA_VIDEO_FORMAT_BGRx,
-				SPA_VIDEO_FORMAT_RGBx,
-				SPA_VIDEO_FORMAT_BGRA
-			),
-			SPA_FORMAT_VIDEO_size, SPA_POD_CHOICE_RANGE_Rectangle(&rectDefault, &rectMin, &rectMax),
-			SPA_FORMAT_VIDEO_framerate, SPA_POD_CHOICE_RANGE_Fraction(&rateDefault, &rateMin, &rateMax),
-			// Same LINEAR-modifier requirement as GamescopeGrabber - a normal compositor's
-			// composited output can be a tiled/compressed DMA-BUF just as easily as
-			// gamescope's, and this code has no way to decode that layout.
-			// SPA_POD_Propf() isn't declared in the SPA headers shipped by all supported
-			// distros (missing on e.g. Ubuntu 24.04's older libspa) - spelled out manually here
-			// instead of relying on that convenience macro. This is its exact expansion where it
-			// does exist (spa/pod/vararg.h: SPA_POD_Propf(key,flags,...) -> SPA_ID_INVALID, key,
-			// flags, ##__VA_ARGS__), so behavior is unchanged on systems where it's available.
-			SPA_ID_INVALID, SPA_FORMAT_VIDEO_modifier, SPA_POD_PROP_FLAG_MANDATORY, SPA_POD_CHOICE_ENUM_Long(2, 0L, 0L)
-		)),
+		static_cast<spa_pod*>(spa_pod_builder_pop(&podBuilder, &outerFrame)),
+		// params[1]: plain memory buffer path (no modifier property at all).
+		// Deliberately no modifier property - see the comment above params[] for why.
 		static_cast<spa_pod*>(spa_pod_builder_add_object(&podBuilder2,
 			SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat,
 			SPA_FORMAT_mediaType,    SPA_POD_Id(SPA_MEDIA_TYPE_video),
@@ -826,9 +842,8 @@ void DesktopPortalGrabber::runStream()
 				SPA_VIDEO_FORMAT_RGBx,
 				SPA_VIDEO_FORMAT_BGRA
 			),
-			SPA_FORMAT_VIDEO_size, SPA_POD_CHOICE_RANGE_Rectangle(&rectDefault, &rectMin, &rectMax),
+			SPA_FORMAT_VIDEO_size,      SPA_POD_CHOICE_RANGE_Rectangle(&rectDefault, &rectMin, &rectMax),
 			SPA_FORMAT_VIDEO_framerate, SPA_POD_CHOICE_RANGE_Fraction(&rateDefault, &rateMin, &rateMax)
-			// Deliberately no modifier property - see the comment above params[] for why.
 		))
 	};
 
