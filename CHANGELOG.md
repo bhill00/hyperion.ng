@@ -63,6 +63,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - ProviderRestAPI - Handle QNetworkAccessManager as direct object
 - Update docker compile to reduce prerequisites and allow ninja build
 - Removed End of Life (EOL), End of LTS versions in builds
+- Fixed - docker-compile script, plus support private git package builds
 
 ## [2.2.0](https://github.com/hyperion-project/hyperion.ng/releases/tag/2.2.0) - 2026-02-02
 
