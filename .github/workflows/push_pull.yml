@@ -23,8 +23,7 @@ jobs:
       matrix:
         debian: [
           { codename: [ 'bookworm', 'Bookworm' ] },
-          { codename: [ 'trixie', 'Trixie' ] },
-          { codename: [ 'forky', 'Forky' ] }
+          { codename: [ 'trixie', 'Trixie' ] }
         ]
     uses: ./.github/workflows/debian.yml
     secrets: inherit
